@@ -1,0 +1,128 @@
+# Builds the image for amd64 and arm64, each on its own kind of runner (no emulation: GCC under QEMU
+# would take a day), then publishes both under one multi-arch tag on GitHub's registry:
+#   ghcr.io/<owner>/vitals-ps3-sdk:latest          the default branch's newest build
+#   ghcr.io/<owner>/vitals-ps3-sdk:ps3dk-<commit>  the newest build of that PS3DK commit
+#   ghcr.io/<owner>/vitals-ps3-sdk:sha-<commit>    this repository's commit
+#   ghcr.io/<owner>/vitals-ps3-sdk:<tag>           a git tag (v1, v2...)
+name: Publish image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["Dockerfile", "patches/**", ".dockerignore", ".github/workflows/publish.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# One build at a time per branch or tag: a newer push cancels the older one
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/vitals-ps3-sdk
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Building GCC twice (PPU and SPU) and the SDK: a few hours on a hosted runner
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      # The builder stage needs about 25 GB; a hosted runner starts with less free, so drop the
+      # preinstalled SDKs this build doesn't use
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+              /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          docker system prune -af
+          df -h /
+
+      # Registry names must be lowercase; an owner's name may not be
+      - name: Image name
+        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest only, untagged: the merge job tags both architectures together
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save the digest
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Image name
+        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag both architectures
+        run: |
+          ps3dk=$(sed -n 's/^ARG PS3DK_COMMIT=//p' Dockerfile)
+          tags=(-t "$IMAGE:sha-${GITHUB_SHA::7}" -t "$IMAGE:ps3dk-$ps3dk")
+          if [ "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            tags+=(-t "$IMAGE:latest")
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tags+=(-t "$IMAGE:$GITHUB_REF_NAME")
+          fi
+          sources=()
+          for digest in digests/*; do
+            sources+=("$IMAGE@sha256:$(basename "$digest")")
+          done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA::7}"

@@ -1,0 +1,69 @@
+# Builds the image for amd64 and arm64, each on GitLab's hosted runner of that kind (no emulation:
+# GCC under QEMU would take a day), then publishes both under one multi-arch tag on the project's
+# container registry:
+#   $CI_REGISTRY_IMAGE:latest          the default branch's newest build
+#   $CI_REGISTRY_IMAGE:ps3dk-<commit>  the newest build of that PS3DK commit
+#   $CI_REGISTRY_IMAGE:sha-<commit>    this repository's commit
+#   $CI_REGISTRY_IMAGE:<tag>           a git tag (v1, v2...)
+# plus one tag per architecture and commit (sha-<commit>-amd64, -arm64), which the multi-arch tags
+# are made from
+stages: [build, publish]
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [Dockerfile, "patches/**/*", .dockerignore, .gitlab-ci.yml]
+
+# A newer pipeline on the same branch cancels the older one's builds (with the project's "Auto-cancel
+# redundant pipelines", on by default); a publish already running is left to finish
+default:
+  interruptible: true
+
+.docker:
+  image: docker:28
+  services: ["docker:28-dind"]
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+.build:
+  extends: .docker
+  stage: build
+  # Building GCC twice (PPU and SPU) and the SDK takes a few hours; GitLab.com's hosted runners
+  # allow at most 3 hours, and the project's own timeout (Settings > CI/CD > General pipelines)
+  # must allow it too
+  timeout: 3h
+  script:
+    - df -h /
+    - docker build --platform "linux/$ARCH" --provenance=false -t "$CI_REGISTRY_IMAGE:sha-$CI_COMMIT_SHORT_SHA-$ARCH" .
+    - docker push "$CI_REGISTRY_IMAGE:sha-$CI_COMMIT_SHORT_SHA-$ARCH"
+
+build-amd64:
+  extends: .build
+  tags: [saas-linux-medium-amd64]
+  variables:
+    ARCH: amd64
+
+build-arm64:
+  extends: .build
+  tags: [saas-linux-medium-arm64]
+  variables:
+    ARCH: arm64
+
+publish:
+  extends: .docker
+  stage: publish
+  interruptible: false
+  script:
+    - ps3dk=$(sed -n 's/^ARG PS3DK_COMMIT=//p' Dockerfile)
+    - tags="-t $CI_REGISTRY_IMAGE:sha-$CI_COMMIT_SHORT_SHA -t $CI_REGISTRY_IMAGE:ps3dk-$ps3dk"
+    - if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then tags="$tags -t $CI_REGISTRY_IMAGE:latest"; fi
+    - if [ -n "$CI_COMMIT_TAG" ]; then tags="$tags -t $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"; fi
+    - docker buildx imagetools create $tags
+        "$CI_REGISTRY_IMAGE:sha-$CI_COMMIT_SHORT_SHA-amd64"
+        "$CI_REGISTRY_IMAGE:sha-$CI_COMMIT_SHORT_SHA-arm64"
+    - docker buildx imagetools inspect "$CI_REGISTRY_IMAGE:sha-$CI_COMMIT_SHORT_SHA"

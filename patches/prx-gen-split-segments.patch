@@ -1,0 +1,220 @@
+diff --git a/tools/prx-gen/src/reloc.rs b/tools/prx-gen/src/reloc.rs
+--- a/tools/prx-gen/src/reloc.rs
++++ b/tools/prx-gen/src/reloc.rs
+@@ -84,6 +84,19 @@
+     /// Value is a difference between two addresses. Invariant when both
+     /// sides live in the same segment, in which case it is dropped.
+     Relative,
++    /// Value is measured from the TOC (r2), not from the patched word:
++    /// invariant when the target lives in the TOC's segment, wherever the
++    /// instruction is. Code reaching its data through the TOC crosses from
++    /// the code segment into the data one, so comparing against the patched
++    /// word's segment (as `Relative` does) would refuse every such access
++    /// once code and data are in separate segments.
++    TocRelative,
++    /// A branch (`R_PPC64_REL24`, `R_PPC64_REL14*`): relative like the
++    /// others, but its symbol is no guide to where it lands. On ELFv1 a
++    /// function's symbol is its `.opd` descriptor, in the data segment, while
++    /// the linker points the branch at the code entry; the linked instruction's
++    /// own displacement says where it goes.
++    Branch,
+     /// Nothing to do (`R_PPC64_NONE`, and link-time-only bookkeeping).
+     Ignore,
+ }
+@@ -104,17 +117,22 @@
+         // holding the TOC.
+         R_PPC64_TOC => Class::Absolute(38),
+ 
+-        R_PPC64_REL24
+-        | R_PPC64_REL14
+-        | R_PPC64_REL14_BRTAKEN
+-        | R_PPC64_REL14_BRNTAKEN
+-        | R_PPC64_REL32
++        R_PPC64_REL24 | R_PPC64_REL14 | R_PPC64_REL14_BRTAKEN | R_PPC64_REL14_BRNTAKEN => {
++            Class::Branch
++        }
++
++        R_PPC64_REL32
+         | R_PPC64_REL64
+         | R_PPC64_REL16
+         | R_PPC64_REL16_LO
+         | R_PPC64_REL16_HI
+         | R_PPC64_REL16_HA
+-        | R_PPC64_GOT16
++        | R_PPC64_SECTOFF
++        | R_PPC64_SECTOFF_LO
++        | R_PPC64_SECTOFF_HI
++        | R_PPC64_SECTOFF_HA => Class::Relative,
++
++        R_PPC64_GOT16
+         | R_PPC64_GOT16_LO
+         | R_PPC64_GOT16_HI
+         | R_PPC64_GOT16_HA
+@@ -125,11 +143,7 @@
+         | R_PPC64_TOC16_HI
+         | R_PPC64_TOC16_HA
+         | R_PPC64_TOC16_DS
+-        | R_PPC64_TOC16_LO_DS
+-        | R_PPC64_SECTOFF
+-        | R_PPC64_SECTOFF_LO
+-        | R_PPC64_SECTOFF_HI
+-        | R_PPC64_SECTOFF_HA => Class::Relative,
++        | R_PPC64_TOC16_LO_DS => Class::TocRelative,
+ 
+         // Absolute forms the Lv-2 loader has no case for.  Reaching one means
+         // the module contains a construct we cannot express; fail loudly
+@@ -210,7 +224,15 @@
+ /// The symbol's own section is therefore the authoritative answer, with
+ /// containment as the fallback for linker-defined symbols that carry no
+ /// section.
+-fn value_base(elf: &Elf, loads: &[Phdr], addr: u64, shndx: u16, warn: &mut Vec<String>, sym_name: &str) -> ValueBase {
++fn value_base(
++    elf: &Elf,
++    loads: &[Phdr],
++    toc_segment: Option<usize>,
++    addr: u64,
++    shndx: u16,
++    warn: &mut Vec<String>,
++    sym_name: &str,
++) -> ValueBase {
+     // 1. The symbol belongs to a real section: use the segment holding it.
+     if shndx != SHN_ABS && shndx != SHN_UNDEF && shndx != SHN_COMMON {
+         if let Some(sec) = elf.shdrs.get(shndx as usize) {
+@@ -227,7 +249,15 @@
+         return ValueBase::Segment(i);
+     }
+ 
+-    // 3. Outside the image, but the module has a single segment, so everything
++    // 3. `.TOC.` past the end of the segment holding the TOC (it is the TOC's
++    //    start + 0x8000): r2 moves with the data it reaches.
++    if sym_name == ".TOC." {
++        if let Some(i) = toc_segment {
++            return ValueBase::Segment(i);
++        }
++    }
++
++    // 4. Outside the image, but the module has a single segment, so everything
+     //    it can name moves by the same delta. `.TOC.` lands here.
+     if loads.len() == 1 {
+         warn.push(format!(
+@@ -237,7 +267,7 @@
+         return ValueBase::Segment(0);
+     }
+ 
+-    // 4. Genuinely absolute.
++    // 5. Genuinely absolute.
+     warn.push(format!(
+         "'{sym_name}' resolves to 0x{addr:x}, outside every PT_LOAD segment; emitting it as a \
+          fixed absolute value"
+@@ -245,6 +275,45 @@
+     ValueBase::Absolute
+ }
+ 
++/// The segment holding the TOC, which `.TOC.` (r2) is measured from: the one
++/// holding `__lv2_got_start`, where the linker scripts start it, or `.got`.
++/// `.TOC.` itself is that start + 0x8000 and can lie past the segment's end;
++/// so can `__lv2_got_start`, at the very end of a segment when the TOC is
++/// empty. `None` without either (no TOC, or not one of these scripts).
++fn toc_segment(elf: &Elf, loads: &[Phdr]) -> Option<usize> {
++    let start = elf
++        .syms
++        .iter()
++        .find(|s| s.name == "__lv2_got_start" && s.st_shndx != SHN_UNDEF)
++        .map(|s| s.st_value)
++        .or_else(|| elf.shdrs.iter().find(|s| s.name == ".got" && s.is_alloc()).map(|s| s.sh_addr))?;
++    loads
++        .iter()
++        .position(|p| p.contains_vaddr(start))
++        .or_else(|| loads.iter().position(|p| p.p_memsz > 0 && start == p.p_vaddr + p.p_memsz))
++}
++
++/// Where the linked branch instruction at `offset` (in `segment`) goes.
++fn branch_target(elf: &Elf, segment: &Phdr, r_type: u32, offset: u64) -> Result<u64> {
++    if offset < segment.p_vaddr || offset + 4 > segment.p_vaddr + segment.p_filesz {
++        bail!("branch at 0x{:x} is not in its segment's file image", offset);
++    }
++    let at = (segment.p_offset + (offset - segment.p_vaddr)) as usize;
++    if at + 4 > elf.data.len() {
++        bail!("branch at 0x{:x} is past the end of the file", offset);
++    }
++    let insn = crate::elf::rd_u32(&elf.data, at);
++    if insn & 2 != 0 {
++        bail!("branch at 0x{:x} is absolute (AA set), which a relocation of type {} cannot be", offset, r_type);
++    }
++    let displacement = if r_type == R_PPC64_REL24 {
++        (((insn & 0x03ff_fffc) << 6) as i32 >> 6) as i64
++    } else {
++        ((insn & 0xfffc) as u16 as i16) as i64
++    };
++    Ok(offset.wrapping_add(displacement as u64))
++}
++
+ /// Convert every allocated `-Wl,-q` relocation into the PRX relocation set.
+ pub fn convert(elf: &Elf) -> Result<Conversion> {
+     if elf.has_merged_rela() {
+@@ -273,6 +342,7 @@
+         bail!("{} PT_LOAD segments; the segment index field is one byte", loads.len());
+     }
+ 
++    let toc_segment = toc_segment(elf, &loads);
+     let mut relocs = Vec::new();
+     let mut dropped = 0usize;
+     let mut warnings = Vec::new();
+@@ -360,9 +430,56 @@
+                     }
+                 }
+             }
++            Class::Branch => {
++                let target = branch_target(elf, &loads[index_addr], rela.r_type, rela.r_offset)?;
++                match elf.load_index_of_vaddr(target) {
++                    Some(s) if s == index_addr => dropped += 1,
++                    Some(s) => bail!(
++                        "branch (type {}) at 0x{:x} to 0x{:x} crosses segments ({} -> {}); keep \
++                         all code in one PT_LOAD",
++                        rela.r_type,
++                        rela.r_offset,
++                        target,
++                        index_addr,
++                        s
++                    ),
++                    None => bail!(
++                        "branch (type {}) at 0x{:x} goes to 0x{:x}, which is outside every PT_LOAD \
++                         segment",
++                        rela.r_type,
++                        rela.r_offset,
++                        target
++                    ),
++                }
++            }
++            Class::TocRelative => {
++                let sym_seg = elf.load_index_of_vaddr(value);
++                // Without a .got the TOC can only be in the patched word's
++                // segment, which is the single-segment rule.
++                let toc_seg = toc_segment.unwrap_or(index_addr);
++                match sym_seg {
++                    Some(s) if s == toc_seg => dropped += 1,
++                    Some(s) => bail!(
++                        "TOC-relative relocation (type {}) at 0x{:x} targets segment {} but the \
++                         TOC is in segment {}; keep .got and everything reached through it in \
++                         one PT_LOAD",
++                        rela.r_type,
++                        rela.r_offset,
++                        s,
++                        toc_seg
++                    ),
++                    None => bail!(
++                        "TOC-relative relocation (type {}) at 0x{:x} targets 0x{:x}, which is \
++                         outside every PT_LOAD segment",
++                        rela.r_type,
++                        rela.r_offset,
++                        value
++                    ),
++                }
++            }
+             Class::Absolute(prx_type) => {
+                 let base =
+-                    value_base(elf, &loads, value, sym.st_shndx, &mut warnings, &sym.name);
++                    value_base(elf, &loads, toc_segment, value, sym.st_shndx, &mut warnings, &sym.name);
+                 let (index_value, ptr) = match base {
+                     ValueBase::Segment(s) => (s as u8, value.wrapping_sub(loads[s].p_vaddr)),
+                     ValueBase::Absolute => (INDEX_VALUE_ABSOLUTE, value),
