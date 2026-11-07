@@ -4,6 +4,7 @@
 #   ghcr.io/<owner>/vitals-ps3-sdk:ps3dk-<commit>  the newest build of that PS3DK commit
 #   ghcr.io/<owner>/vitals-ps3-sdk:sha-<commit>    this repository's commit
 #   ghcr.io/<owner>/vitals-ps3-sdk:<tag>           a git tag (v1, v2...)
+# and the same tags on Docker Hub (<user>/vitals-ps3-sdk) when the Docker Hub secrets are set
 name: Publish image
 
 on:
@@ -90,6 +91,9 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    # Secrets can't be tested in a step's if; an empty one is an empty variable here
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@v4
 
@@ -113,16 +117,41 @@ jobs:
       - name: Tag both architectures
         run: |
           ps3dk=$(sed -n 's/^ARG PS3DK_COMMIT=//p' Dockerfile)
-          tags=(-t "$IMAGE:sha-${GITHUB_SHA::7}" -t "$IMAGE:ps3dk-$ps3dk")
+          names=("sha-${GITHUB_SHA::7}" "ps3dk-$ps3dk")
           if [ "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
-            tags+=(-t "$IMAGE:latest")
+            names+=(latest)
           fi
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            tags+=(-t "$IMAGE:$GITHUB_REF_NAME")
+            names+=("$GITHUB_REF_NAME")
           fi
+          echo "TAGS=${names[*]}" >> "$GITHUB_ENV"
+          tags=()
+          for name in "${names[@]}"; do
+            tags+=(-t "$IMAGE:$name")
+          done
           sources=()
           for digest in digests/*; do
             sources+=("$IMAGE@sha256:$(basename "$digest")")
           done
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
           docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA::7}"
+
+      # Docker Hub too, when the repository has the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets:
+      # the same image, copied from GitHub's registry rather than built again. Give the secrets to
+      # GitHub or GitLab, not both, or each would overwrite the other's tags
+      - uses: docker/login-action@v3
+        if: env.DOCKERHUB_USERNAME != ''
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        run: |
+          hub="docker.io/${DOCKERHUB_USERNAME,,}/vitals-ps3-sdk"
+          tags=()
+          for name in $TAGS; do
+            tags+=(-t "$hub:$name")
+          done
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:sha-${GITHUB_SHA::7}"
+          docker buildx imagetools inspect "$hub:sha-${GITHUB_SHA::7}"

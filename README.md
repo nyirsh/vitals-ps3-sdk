@@ -13,10 +13,14 @@ The image is about 1.5 GB, for `linux/amd64` and `linux/arm64`.
 docker pull ghcr.io/OWNER/vitals-ps3-sdk:latest
 ```
 
-or from GitLab:
+or from GitLab or Docker Hub:
 
 ```bash
 docker pull registry.gitlab.com/NAMESPACE/vitals-ps3-sdk:latest
+```
+
+```bash
+docker pull nyirsh/vitals-ps3-sdk:latest
 ```
 
 Then, in vitals-ps3, point the Makefile at it instead of building it locally:
@@ -54,6 +58,8 @@ registries) can remove the old ones.
 - `.github/workflows/publish.yml`: GitHub Actions, publishing to `ghcr.io/<owner>/vitals-ps3-sdk`.
 - `.gitlab-ci.yml`: GitLab CI, publishing to the project's container registry.
 
+Either CI also copies the image to Docker Hub when it has Docker Hub credentials (see below).
+
 These are a copy of vitals-ps3's `tools/docker`, which vitals-ps3's `make image` still builds from.
 A change to one should be made to the other until vitals-ps3 uses the published image.
 
@@ -87,6 +93,21 @@ building GCC under emulation would take far longer than any runner allows.
   own job timeout (Settings > CI/CD > General pipelines > Timeout) must be at least that.
 - **Registry:** the Container Registry must be enabled (Settings > General > Visibility); the jobs
   log in with the job's own credentials, so no variable is needed.
+
+### Docker Hub
+
+Whichever CI has the credentials copies the published image to Docker Hub
+(`<username>/vitals-ps3-sdk`, the same tags), without building it again. Give them to one of the
+two only: both would overwrite each other's tags with builds that work the same but differ in bytes.
+They're on GitHub now; to move Docker Hub publishing, move the credentials and nothing else.
+
+- **Token:** hub.docker.com > Account settings > Personal access tokens, with Read & Write access.
+  The repository is created by the first push; create it beforehand to set its description.
+- **GitHub:** the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (Settings > Secrets
+  and variables > Actions).
+- **GitLab:** the same two as CI/CD variables (Settings > CI/CD > Variables), the token masked. If
+  they're protected, the default branch and the `v*` tags must be protected too, or the jobs don't
+  get them.
 
 ## Building it locally
 
